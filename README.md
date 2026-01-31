@@ -4,7 +4,7 @@
 
 This project allows for air-gapped short-range communication, making it suitable for secure authentication, proximity-based data sharing, and experimental "audio steganography".
 
-## 🚀 Features
+##  Features
 
 - **Inaudible Transmission**: Defaults to **20 kHz (0)** and **21.5 kHz (1)**, operating near the upper limit of human hearing.
 - **Robust Modulation**: Uses **Continuous-Phase FSK (CPFSK)** to ensure smooth waveform transitions and reduce spectral splatter.
@@ -16,7 +16,7 @@ This project allows for air-gapped short-range communication, making it suitable
 - **Error Checking**: Implements checksums for data integrity and repeated-bit coding for noise resistance.
 - **Cross-Platform**: Works on Windows, Linux, and macOS.
 
-## 📦 Installation
+##  Installation
 
 ### Prerequisites
 
@@ -33,7 +33,7 @@ pip install numpy scipy sounddevice matplotlib cryptography
 
 *Note: `sounddevice` is required for live playback/recording. `matplotlib` is required for the GUI visualization.*
 
-## 🖥️ Usage: GUI Application
+##  Usage: GUI Application
 
 The easiest way to use DHWANI is via the Graphical User Interface.
 
@@ -56,7 +56,7 @@ python gui.py
   - **Decode**: Process the signal to extract the message.
 - **Visualization**: View real-time Waveform and Spectrogram analysis of received signals.
 
-## 💻 Usage: Command Line
+##  Usage: Command Line
 
 You can also use the standalone scripts for automation or headless operation.
 
@@ -133,7 +133,7 @@ The protocol uses a robust framing structure to ensure reliable detection.
 - **Frequencies**: Default $F_0 = 20 \text{ kHz}$, $F_1 = 21.5 \text{ kHz}$.
 - **Bit Duration**: Default 30ms (approx 33 baud).
 
-## 🔧 Troubleshooting
+##  Troubleshooting
 
 - **"No START flag found"**:
   - Ensure the volume is loud enough.
@@ -144,6 +144,6 @@ The protocol uses a robust framing structure to ensure reliable detection.
 - **Cannot hear anything?**:
   - This is intentional! The default frequencies are near-ultrasonic. Use specific Audio Analyzers or the GUI Spectrogram to "see" the sound.
 
-## 📄 License
+##  License
 
 This project is open-source and available for educational and experimental use.
