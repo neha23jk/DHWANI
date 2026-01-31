@@ -1,339 +1,310 @@
 #!/usr/bin/env python3
 """
-BFSK Acoustic Authentication Sender
+BFSK Acoustic Sender
+Encodes short text/data into a BFSK audio signal for acoustic transmission.
 
-Binary Frequency Shift Keying transmitter for short-range acoustic authentication.
-Transmits structured packets through speakers using near-ultrasonic frequencies.
+Packet Structure: [START:8][UNIT_ID:4][LENGTH:8][PAYLOAD:N*8][CHECKSUM:8][END:8]
 """
 
-import numpy as np
-import sounddevice as sd
-import hashlib
 import argparse
+import hashlib
+import os
+import base64
+import numpy as np
+from scipy.io.wavfile import write
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
+# Optional encryption support
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    HAS_CRYPTO = True
+except ImportError:
+    HAS_CRYPTO = False
 
-F0 = 17000          # Frequency for bit 0 (Hz)
-F1 = 18500          # Frequency for bit 1 (Hz)
-BIT_DURATION = 0.08 # Bit duration in seconds (80ms)
-SAMPLE_RATE = 44100 # Audio sample rate (Hz)
 
-# Packet markers
-START_MARKER = "10101010"
-END_MARKER = "11111111"
-
-# =============================================================================
-# DEVICE SELECTION
-# =============================================================================
-
-def list_output_devices():
-    """List all available audio output devices."""
-    print("\n" + "=" * 60)
-    print("AVAILABLE OUTPUT DEVICES")
-    print("=" * 60)
-    devices = sd.query_devices()
-    output_devices = []
-    for i, device in enumerate(devices):
-        if device['max_output_channels'] > 0:
-            output_devices.append((i, device['name']))
-            print(f"  [{i}] {device['name']}")
-    print("=" * 60 + "\n")
-    return output_devices
-
-def get_default_output_device():
-    """Get the default output device ID."""
-    return sd.default.device[1]
-
-# =============================================================================
-# TONE GENERATION
-# =============================================================================
-
-def generate_tone(frequency, duration, sample_rate=SAMPLE_RATE):
+def derive_key(password: str, salt: bytes = None) -> tuple:
     """
-    Generate a sine wave tone at the specified frequency.
+    Derive a 256-bit AES key from a password using PBKDF2.
+    Returns (key, salt) - salt is generated if not provided.
+    """
+    if salt is None:
+        salt = os.urandom(16)
     
-    Args:
-        frequency: Tone frequency in Hz
-        duration: Duration in seconds
-        sample_rate: Sample rate in Hz
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,  # 256-bit key
+        salt=salt,
+        iterations=100000,
+    )
+    key = kdf.derive(password.encode())
+    return key, salt
+
+
+def encrypt_payload(plaintext: str, password: str) -> bytes:
+    """
+    Encrypt plaintext using AES-256-GCM.
+    
+    Output format: salt (16 bytes) + nonce (12 bytes) + ciphertext + tag (16 bytes)
+    """
+    if not HAS_CRYPTO:
+        raise ImportError("cryptography library not installed. Run: pip install cryptography")
+    
+    # Derive key from password
+    key, salt = derive_key(password)
+    
+    # Generate random nonce
+    nonce = os.urandom(12)
+    
+    # Encrypt with AES-GCM
+    aesgcm = AESGCM(key)
+    ciphertext = aesgcm.encrypt(nonce, plaintext.encode('utf-8'), None)
+    
+    # Combine: salt + nonce + ciphertext (includes auth tag)
+    return salt + nonce + ciphertext
+
+# Default parameters
+DEFAULT_F0 = 20000       # Frequency for bit '0' (Hz)
+DEFAULT_F1 = 21500       # Frequency for bit '1' (Hz)
+DEFAULT_BIT_DURATION = 0.03  # 30ms per bit
+DEFAULT_SAMPLE_RATE = 44100  # 44.1 kHz
+DEFAULT_REPEAT = 1       # Bit repetition factor
+
+# Preamble: alternating pattern for receiver sync
+PREAMBLE = "10101010101010101010101010101010"  # 32 bits
+# START_FLAG must be distinct from preamble pattern
+START_FLAG = "11001100"  # Different from alternating 10101010
+END_FLAG = "11111111"
+
+
+def text_to_bits(text: str) -> str:
+    """Convert text string to binary string."""
+    return ''.join(format(ord(c), '08b') for c in text)
+
+
+def compute_checksum(data_bytes: bytes) -> int:
+    """Compute simple 8-bit checksum (sum mod 256)."""
+    return sum(data_bytes) % 256
+
+
+def generate_cpfsk(bitstream: str, f0: float, f1: float, 
+                   bit_duration: float, fs: int) -> np.ndarray:
+    """
+    Generate continuous-phase FSK (CPFSK) waveform.
+    
+    Uses cumulative phase to avoid discontinuities at bit boundaries.
+    """
+    samples_per_bit = int(bit_duration * fs)
+    total_samples = len(bitstream) * samples_per_bit
+    
+    signal = np.zeros(total_samples)
+    phase = 0.0
+    
+    for i, bit in enumerate(bitstream):
+        freq = f1 if bit == '1' else f0
+        start_idx = i * samples_per_bit
         
-    Returns:
-        numpy array containing the audio samples
-    """
-    t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
-    # Apply a small fade in/out to reduce clicking
-    tone = np.sin(2 * np.pi * frequency * t)
+        for j in range(samples_per_bit):
+            signal[start_idx + j] = np.sin(phase)
+            phase += 2 * np.pi * freq / fs
+            # Keep phase bounded to avoid numerical issues
+            if phase > 2 * np.pi:
+                phase -= 2 * np.pi
     
-    # Apply envelope to reduce clicks (5ms fade)
-    fade_samples = int(0.005 * sample_rate)
-    if fade_samples > 0 and len(tone) > 2 * fade_samples:
-        fade_in = np.linspace(0, 1, fade_samples)
-        fade_out = np.linspace(1, 0, fade_samples)
-        tone[:fade_samples] *= fade_in
-        tone[-fade_samples:] *= fade_out
-    
-    return tone.astype(np.float32)
+    return signal
 
-# =============================================================================
-# BFSK MODULATION
-# =============================================================================
 
-def bfsk_modulate(bits, f0=F0, f1=F1, bit_duration=BIT_DURATION, sample_rate=SAMPLE_RATE):
+def build_packet(unit_id: int, payload: str) -> str:
     """
-    Modulate a bit string using Binary Frequency Shift Keying.
+    Build complete packet bitstream.
     
-    Args:
-        bits: String of '0' and '1' characters
-        f0: Frequency for bit 0
-        f1: Frequency for bit 1
-        bit_duration: Duration of each bit in seconds
-        sample_rate: Audio sample rate
-        
-    Returns:
-        numpy array containing the modulated audio signal
+    Structure: [START:8][UNIT_ID:4][LENGTH:8][PAYLOAD:N*8][CHECKSUM:8][END:8]
     """
-    audio_segments = []
+    # Unit ID: 4 bits (0-15)
+    unit_bits = format(unit_id & 0xF, '04b')
     
-    for bit in bits:
-        if bit == '0':
-            tone = generate_tone(f0, bit_duration, sample_rate)
-        elif bit == '1':
-            tone = generate_tone(f1, bit_duration, sample_rate)
-        else:
-            raise ValueError(f"Invalid bit value: {bit}")
-        audio_segments.append(tone)
+    # Payload: convert to bytes then bits
+    payload_bytes = payload.encode('utf-8')
+    payload_bits = ''.join(format(b, '08b') for b in payload_bytes)
     
-    # Concatenate all segments for continuous transmission
-    return np.concatenate(audio_segments)
-
-# =============================================================================
-# TOKEN AND CHECKSUM
-# =============================================================================
-
-def generate_token(secret):
-    """
-    Generate a 32-bit authentication token using SHA-256.
+    # Length: 8 bits (0-255 bytes)
+    length_bits = format(len(payload_bytes) & 0xFF, '08b')
     
-    Args:
-        secret: Secret string to hash
-        
-    Returns:
-        8 character hex string (32 bits)
-    """
-    hash_obj = hashlib.sha256(secret.encode('utf-8'))
-    return hash_obj.hexdigest()[:8]
-
-def hex_to_binary(hex_string):
-    """Convert hex string to binary string."""
-    return bin(int(hex_string, 16))[2:].zfill(len(hex_string) * 4)
-
-def compute_checksum(payload_bytes):
-    """
-    Compute 8-bit checksum (sum of bytes mod 256).
-    
-    Args:
-        payload_bytes: Bytes to checksum
-        
-    Returns:
-        8-bit checksum as integer
-    """
-    return sum(payload_bytes) % 256
-
-# =============================================================================
-# PACKET CONSTRUCTION
-# =============================================================================
-
-def build_packet(unit_id, secret):
-    """
-    Build a complete transmission packet.
-    
-    Packet structure:
-    [START 8-bit][UNIT_ID 8-bit][PAYLOAD 32-bit][CHECKSUM 8-bit][END 8-bit]
-    
-    Args:
-        unit_id: Device identifier (0-255)
-        secret: Secret string for token generation
-        
-    Returns:
-        Tuple of (binary string packet, packet info dict)
-    """
-    # Generate token
-    token_hex = generate_token(secret)
-    token_binary = hex_to_binary(token_hex)
-    
-    # Convert token to bytes for checksum
-    payload_bytes = bytes.fromhex(token_hex)
-    
-    # Compute checksum
+    # Checksum: 8-bit sum of payload bytes
     checksum = compute_checksum(payload_bytes)
-    checksum_binary = bin(checksum)[2:].zfill(8)
+    checksum_bits = format(checksum, '08b')
     
-    # Format unit ID as 8-bit binary
-    unit_id_binary = bin(unit_id)[2:].zfill(8)
+    # Assemble packet (preamble + packet)
+    packet = PREAMBLE + START_FLAG + unit_bits + length_bits + payload_bits + checksum_bits + END_FLAG
     
-    # Assemble packet
-    packet = (
-        START_MARKER +      # 8 bits
-        unit_id_binary +    # 8 bits
-        token_binary +      # 32 bits
-        checksum_binary +   # 8 bits
-        END_MARKER          # 8 bits
-    )  # Total: 64 bits
-    
-    packet_info = {
-        'start': START_MARKER,
-        'unit_id': unit_id_binary,
-        'unit_id_dec': unit_id,
-        'token_hex': token_hex,
-        'token_binary': token_binary,
-        'checksum': checksum,
-        'checksum_binary': checksum_binary,
-        'end': END_MARKER,
-        'total_bits': len(packet)
-    }
-    
-    return packet, packet_info
+    return packet
 
-# =============================================================================
-# TRANSMISSION
-# =============================================================================
 
-def transmit(packet, device_id=None, sample_rate=SAMPLE_RATE):
+def build_auth_packet(unit_id: int, secret: str) -> str:
     """
-    Transmit the packet as audio through speakers.
+    Build authentication packet with SHA-256 token.
     
-    Args:
-        packet: Binary string to transmit
-        device_id: Output device ID (None for default)
-        sample_rate: Audio sample rate
+    Structure: [START:8][UNIT_ID:4][TOKEN:32][CHECKSUM:8][END:8]
     """
-    # Generate modulated audio
-    audio = bfsk_modulate(packet, sample_rate=sample_rate)
+    # Unit ID: 4 bits
+    unit_bits = format(unit_id & 0xF, '04b')
     
-    # Normalize audio
-    audio = audio / np.max(np.abs(audio)) * 0.8
+    # Token: first 8 hex chars of SHA-256 hash -> 32 bits
+    token_hex = hashlib.sha256(secret.encode()).hexdigest()[:8]
+    token_int = int(token_hex, 16)
+    token_bits = format(token_int, '032b')
     
-    # Play audio
-    sd.play(audio, sample_rate, device=device_id)
-    sd.wait()
+    # Token as 4 bytes for checksum
+    token_bytes = token_int.to_bytes(4, 'big')
+    checksum = compute_checksum(token_bytes)
+    checksum_bits = format(checksum, '08b')
+    
+    # Assemble packet (preamble + packet)
+    packet = PREAMBLE + START_FLAG + unit_bits + token_bits + checksum_bits + END_FLAG
+    
+    return packet
 
-def print_packet_info(packet_info):
-    """Print packet information in a formatted way."""
-    print("\n" + "=" * 60)
-    print("PACKET INFORMATION")
-    print("=" * 60)
-    print(f"  START:      {packet_info['start']}")
-    print(f"  UNIT_ID:    {packet_info['unit_id']} (Device {packet_info['unit_id_dec']})")
-    print(f"  PAYLOAD:    {packet_info['token_binary']}")
-    print(f"              (0x{packet_info['token_hex'].upper()})")
-    print(f"  CHECKSUM:   {packet_info['checksum_binary']} ({packet_info['checksum']})")
-    print(f"  END:        {packet_info['end']}")
-    print("-" * 60)
-    print(f"  Total bits: {packet_info['total_bits']}")
-    print(f"  Duration:   {packet_info['total_bits'] * BIT_DURATION:.2f} seconds")
-    print("=" * 60 + "\n")
 
-# =============================================================================
-# MAIN
-# =============================================================================
+def build_encrypted_packet(unit_id: int, encrypted_bytes: bytes) -> str:
+    """
+    Build encrypted data packet.
+    
+    Structure: [PREAMBLE:32][ENCRYPTED_FLAG:8][UNIT_ID:4][LENGTH:8][ENCRYPTED_DATA:N*8][CHECKSUM:8][END:8]
+    
+    Uses ENCRYPTED_FLAG (11110000) instead of START_FLAG to indicate encrypted payload.
+    """
+    ENCRYPTED_FLAG = "11110000"  # Different from START_FLAG to mark encrypted packets
+    
+    # Unit ID: 4 bits (0-15)
+    unit_bits = format(unit_id & 0xF, '04b')
+    
+    # Encrypted payload as bits
+    payload_bits = ''.join(format(b, '08b') for b in encrypted_bytes)
+    
+    # Length: 8 bits (0-255 bytes)
+    length_bits = format(len(encrypted_bytes) & 0xFF, '08b')
+    
+    # Checksum: 8-bit sum of encrypted bytes
+    checksum = compute_checksum(encrypted_bytes)
+    checksum_bits = format(checksum, '08b')
+    
+    # Assemble packet (preamble + encrypted packet)
+    packet = PREAMBLE + ENCRYPTED_FLAG + unit_bits + length_bits + payload_bits + checksum_bits + END_FLAG
+    
+    return packet
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description="BFSK Acoustic Authentication Sender",
+        description="BFSK Acoustic Sender - Encode data into FSK audio",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python sender.py --secret mysecret --unit-id 42
-  python sender.py --list-devices
-  python sender.py --secret mysecret --device 3
+  # Send custom message
+  python sender.py --unit-id 1 --data "Hello"
+  
+  # Send encrypted message
+  python sender.py --unit-id 1 --data "Secret message" --encrypt --key "mypassword"
+  
+  # Send authentication token
+  python sender.py --unit-id 1 --secret "my_secret" --auth-mode
+  
+  # Custom frequencies
+  python sender.py --unit-id 1 --data "Test" --f0 16000 --f1 17500
         """
     )
     
-    parser.add_argument('--secret', type=str, default='unit_secret',
-                        help='Secret string for token generation (default: unit_secret)')
     parser.add_argument('--unit-id', type=int, default=1,
-                        help='Unit ID (0-255, default: 1)')
-    parser.add_argument('--device', type=int, default=None,
-                        help='Output device ID (default: system default)')
-    parser.add_argument('--list-devices', action='store_true',
-                        help='List available output devices and exit')
-    parser.add_argument('--bit-duration', type=float, default=BIT_DURATION,
-                        help=f'Bit duration in seconds (default: {BIT_DURATION})')
-    parser.add_argument('--f0', type=int, default=F0,
-                        help=f'Frequency for bit 0 in Hz (default: {F0})')
-    parser.add_argument('--f1', type=int, default=F1,
-                        help=f'Frequency for bit 1 in Hz (default: {F1})')
-    parser.add_argument('--sample-rate', type=int, default=SAMPLE_RATE,
-                        help=f'Sample rate in Hz (default: {SAMPLE_RATE})')
-    parser.add_argument('--test-tone', action='store_true',
-                        help='Play a test tone (F0 then F1) and exit')
+                        help='Unit ID (0-15, default: 1)')
+    parser.add_argument('--data', type=str, default=None,
+                        help='Short text/data to transmit (max 255 bytes)')
+    parser.add_argument('--secret', type=str, default=None,
+                        help='Secret passphrase for auth token')
+    parser.add_argument('--auth-mode', action='store_true',
+                        help='Use 32-bit auth token mode instead of data mode')
+    parser.add_argument('--encrypt', action='store_true',
+                        help='Encrypt payload with AES-256-GCM (requires --key)')
+    parser.add_argument('--key', type=str, default=None,
+                        help='Encryption key/password for AES encryption')
+    parser.add_argument('--output', type=str, default='packet.wav',
+                        help='Output WAV file (default: packet.wav)')
+    parser.add_argument('--f0', type=float, default=DEFAULT_F0,
+                        help=f'Frequency for bit 0 (default: {DEFAULT_F0} Hz)')
+    parser.add_argument('--f1', type=float, default=DEFAULT_F1,
+                        help=f'Frequency for bit 1 (default: {DEFAULT_F1} Hz)')
+    parser.add_argument('--bit-duration', type=float, default=DEFAULT_BIT_DURATION,
+                        help=f'Bit duration in seconds (default: {DEFAULT_BIT_DURATION})')
+    parser.add_argument('--sample-rate', type=int, default=DEFAULT_SAMPLE_RATE,
+                        help=f'Sample rate (default: {DEFAULT_SAMPLE_RATE} Hz)')
+    parser.add_argument('--repeat', type=int, default=DEFAULT_REPEAT,
+                        help=f'Repeat each bit N times for noise resistance (default: {DEFAULT_REPEAT})')
     
     args = parser.parse_args()
     
-    # Use local config values from args
-    cfg_f0 = args.f0
-    cfg_f1 = args.f1
-    cfg_bit_duration = args.bit_duration
-    cfg_sample_rate = args.sample_rate
-    
-    # List devices mode
-    if args.list_devices:
-        list_output_devices()
-        return
-    
-    # Test tone mode
-    if args.test_tone:
-        print("\n[TEST] Playing tone at F0 ({} Hz)...".format(cfg_f0))
-        tone0 = generate_tone(cfg_f0, 0.5, cfg_sample_rate)
-        sd.play(tone0, cfg_sample_rate, device=args.device)
-        sd.wait()
+    # Validate inputs
+    if args.auth_mode:
+        if not args.secret:
+            parser.error("--secret is required in auth mode")
+        packet = build_auth_packet(args.unit_id, args.secret)
+        print(f"[AUTH MODE] Unit ID: {args.unit_id}")
+        print(f"[AUTH MODE] Token derived from secret")
+    else:
+        if not args.data:
+            parser.error("--data is required (or use --auth-mode with --secret)")
         
-        print("[TEST] Playing tone at F1 ({} Hz)...".format(cfg_f1))
-        tone1 = generate_tone(cfg_f1, 0.5, cfg_sample_rate)
-        sd.play(tone1, cfg_sample_rate, device=args.device)
-        sd.wait()
-        print("[TEST] Done.\n")
-        return
+        # Handle encryption
+        if args.encrypt:
+            if not args.key:
+                parser.error("--key is required when using --encrypt")
+            if not HAS_CRYPTO:
+                parser.error("cryptography library not installed. Run: pip install cryptography")
+            
+            # Encrypt the payload
+            encrypted_bytes = encrypt_payload(args.data, args.key)
+            
+            # Check encrypted size
+            if len(encrypted_bytes) > 255:
+                parser.error(f"Encrypted data too long ({len(encrypted_bytes)} bytes, max 255)")
+            
+            # Build packet with encrypted bytes (use hex encoding for transmission)
+            payload_hex = encrypted_bytes.hex()
+            packet = build_encrypted_packet(args.unit_id, encrypted_bytes)
+            print(f"[ENCRYPTED MODE] Unit ID: {args.unit_id}")
+            print(f"[ENCRYPTED MODE] Original: {args.data}")
+            print(f"[ENCRYPTED MODE] Encrypted size: {len(encrypted_bytes)} bytes")
+        else:
+            if len(args.data.encode('utf-8')) > 255:
+                parser.error("Data too long (max 255 bytes)")
+            packet = build_packet(args.unit_id, args.data)
+            print(f"[DATA MODE] Unit ID: {args.unit_id}")
+            print(f"[DATA MODE] Payload: {args.data}")
     
-    # Validate unit ID
-    if not 0 <= args.unit_id <= 255:
-        print("Error: Unit ID must be between 0 and 255")
-        return
+    # Apply bit repetition if requested
+    if args.repeat > 1:
+        packet = ''.join(bit * args.repeat for bit in packet)
+        print(f"[INFO] Bit repetition: {args.repeat}x")
     
-    # Build packet
-    packet, packet_info = build_packet(args.unit_id, args.secret)
+    print(f"[INFO] Packet length: {len(packet)} bits (including preamble)")
+    print(f"[INFO] Frequencies: f0={args.f0} Hz, f1={args.f1} Hz")
+    print(f"[INFO] Bit duration: {args.bit_duration * 1000:.0f} ms")
+    print(f"[INFO] Total TX time: {len(packet) * args.bit_duration:.2f} seconds")
     
-    # Print packet info
-    print("\n" + "=" * 60)
-    print("PACKET INFORMATION")
-    print("=" * 60)
-    print(f"  START:      {packet_info['start']}")
-    print(f"  UNIT_ID:    {packet_info['unit_id']} (Device {packet_info['unit_id_dec']})")
-    print(f"  PAYLOAD:    {packet_info['token_binary']}")
-    print(f"              (0x{packet_info['token_hex'].upper()})")
-    print(f"  CHECKSUM:   {packet_info['checksum_binary']} ({packet_info['checksum']})")
-    print(f"  END:        {packet_info['end']}")
-    print("-" * 60)
-    print(f"  Total bits: {packet_info['total_bits']}")
-    print(f"  Duration:   {packet_info['total_bits'] * cfg_bit_duration:.2f} seconds")
-    print("=" * 60 + "\n")
+    # Generate CPFSK signal
+    signal = generate_cpfsk(
+        packet, 
+        args.f0, args.f1, 
+        args.bit_duration, 
+        args.sample_rate
+    )
     
-    # Transmit
-    device_name = "default" if args.device is None else f"device {args.device}"
-    print(f"[TX] Transmitting packet via {device_name}...")
-    print(f"[TX] Frequencies: F0={cfg_f0}Hz, F1={cfg_f1}Hz")
-    print(f"[TX] Bit duration: {cfg_bit_duration*1000:.0f}ms")
+    # Normalize to 16-bit PCM
+    signal = signal / np.max(np.abs(signal))  # Normalize to [-1, 1]
+    signal_int16 = (signal * 32767).astype(np.int16)
     
-    # Generate modulated audio with custom settings
-    audio = bfsk_modulate(packet, f0=cfg_f0, f1=cfg_f1, bit_duration=cfg_bit_duration, sample_rate=cfg_sample_rate)
-    audio = audio / np.max(np.abs(audio)) * 0.8
-    sd.play(audio, cfg_sample_rate, device=args.device)
-    sd.wait()
-    
-    print("[TX] Transmission complete.\n")
+    # Write WAV file
+    write(args.output, args.sample_rate, signal_int16)
+    print(f"[SUCCESS] Wrote {args.output}")
+
 
 if __name__ == "__main__":
     main()
-

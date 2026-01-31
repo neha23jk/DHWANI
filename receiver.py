@@ -1,428 +1,545 @@
 #!/usr/bin/env python3
 """
-BFSK Acoustic Authentication Receiver
+BFSK Acoustic Receiver
+Demodulates FSK audio to recover transmitted data/authentication tokens.
 
-Binary Frequency Shift Keying receiver for short-range acoustic authentication.
-Records audio from microphone and decodes structured packets using FFT analysis.
+Supports three packet formats:
+- Data mode: [START:8][UNIT_ID:4][LENGTH:8][PAYLOAD:N*8][CHECKSUM:8][END:8]
+- Auth mode: [START:8][UNIT_ID:4][TOKEN:32][CHECKSUM:8][END:8]
+- Encrypted mode: [ENCRYPTED_FLAG:8][UNIT_ID:4][LENGTH:8][ENCRYPTED_DATA:N*8][CHECKSUM:8][END:8]
 """
 
-import numpy as np
-import sounddevice as sd
 import argparse
-from scipy.fft import fft, fftfreq
+import hashlib
+import numpy as np
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
+try:
+    import sounddevice as sd
+    HAS_SOUNDDEVICE = True
+except ImportError:
+    HAS_SOUNDDEVICE = False
 
-F0 = 17000          # Frequency for bit 0 (Hz)
-F1 = 18500          # Frequency for bit 1 (Hz)
-BIT_DURATION = 0.08 # Bit duration in seconds (80ms)
-SAMPLE_RATE = 44100 # Audio sample rate (Hz)
+# Optional encryption support
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    HAS_CRYPTO = True
+except ImportError:
+    HAS_CRYPTO = False
 
-# Packet markers
-START_MARKER = "10101010"
-END_MARKER = "11111111"
+from scipy.io.wavfile import read as wav_read
 
-# Packet structure sizes (in bits)
-START_SIZE = 8
-UNIT_ID_SIZE = 8
-PAYLOAD_SIZE = 32
-CHECKSUM_SIZE = 8
-END_SIZE = 8
-TOTAL_PACKET_SIZE = START_SIZE + UNIT_ID_SIZE + PAYLOAD_SIZE + CHECKSUM_SIZE + END_SIZE
+# Default parameters (must match sender)
+DEFAULT_F0 = 20000
+DEFAULT_F1 = 21500
+DEFAULT_BIT_DURATION = 0.03
+DEFAULT_SAMPLE_RATE = 44100
+DEFAULT_REPEAT = 1
+DEFAULT_ENERGY_THRESHOLD = 0.01  # Minimum signal energy to decode
 
-# =============================================================================
-# DEVICE SELECTION
-# =============================================================================
+START_FLAG = "11001100"  # Distinct from alternating preamble
+ENCRYPTED_FLAG = "11110000"  # Marks encrypted packets
+END_FLAG = "11111111"
 
-def list_input_devices():
-    """List all available audio input devices."""
-    print("\n" + "=" * 60)
-    print("AVAILABLE INPUT DEVICES")
-    print("=" * 60)
-    devices = sd.query_devices()
-    input_devices = []
-    for i, device in enumerate(devices):
-        if device['max_input_channels'] > 0:
-            input_devices.append((i, device['name']))
-            print(f"  [{i}] {device['name']}")
-    print("=" * 60 + "\n")
-    return input_devices
 
-def get_default_input_device():
-    """Get the default input device ID."""
-    return sd.default.device[0]
-
-# =============================================================================
-# AUDIO RECORDING
-# =============================================================================
-
-def record_audio(duration, device_id=None, sample_rate=SAMPLE_RATE):
+def derive_key(password: str, salt: bytes) -> bytes:
     """
-    Record audio from the microphone.
-    
-    Args:
-        duration: Recording duration in seconds
-        device_id: Input device ID (None for default)
-        sample_rate: Sample rate in Hz
-        
-    Returns:
-        numpy array of recorded audio samples
+    Derive a 256-bit AES key from a password using PBKDF2.
     """
-    print(f"[RX] Recording for {duration:.1f} seconds...")
-    recording = sd.rec(
-        int(duration * sample_rate),
-        samplerate=sample_rate,
-        channels=1,
-        dtype='float32',
-        device=device_id
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,  # 256-bit key
+        salt=salt,
+        iterations=100000,
     )
-    sd.wait()
-    print("[RX] Recording complete.")
-    return recording.flatten()
+    return kdf.derive(password.encode())
 
-# =============================================================================
-# FREQUENCY DETECTION
-# =============================================================================
 
-def detect_frequency(window, sample_rate=SAMPLE_RATE, f0=F0, f1=F1):
+def decrypt_payload(encrypted_bytes: bytes, password: str) -> str:
     """
-    Detect the dominant frequency in an audio window using FFT.
+    Decrypt AES-256-GCM encrypted payload.
     
-    Args:
-        window: Audio samples for one bit duration
-        sample_rate: Sample rate in Hz
-        f0: Frequency for bit 0
-        f1: Frequency for bit 1
-        
-    Returns:
-        Detected bit ('0' or '1')
+    Input format: salt (16 bytes) + nonce (12 bytes) + ciphertext + tag (16 bytes)
     """
-    n = len(window)
+    if not HAS_CRYPTO:
+        raise ImportError("cryptography library not installed. Run: pip install cryptography")
     
-    # Apply Hanning window to reduce spectral leakage
-    windowed = window * np.hanning(n)
+    # Extract components
+    salt = encrypted_bytes[:16]
+    nonce = encrypted_bytes[16:28]
+    ciphertext = encrypted_bytes[28:]
     
-    # Compute FFT
-    yf = fft(windowed)
-    xf = fftfreq(n, 1 / sample_rate)
+    # Derive key from password
+    key = derive_key(password, salt)
     
-    # Only look at positive frequencies
-    positive_mask = xf > 0
-    xf_positive = xf[positive_mask]
-    yf_positive = np.abs(yf[positive_mask])
+    # Decrypt with AES-GCM
+    aesgcm = AESGCM(key)
+    plaintext = aesgcm.decrypt(nonce, ciphertext, None)
     
-    # Focus on frequency range around F0 and F1
-    freq_min = min(f0, f1) - 1000
-    freq_max = max(f0, f1) + 1000
-    range_mask = (xf_positive >= freq_min) & (xf_positive <= freq_max)
-    
-    if not np.any(range_mask):
-        # Fallback: return based on overall energy comparison
-        return '0'
-    
-    xf_range = xf_positive[range_mask]
-    yf_range = yf_positive[range_mask]
-    
-    # Find the dominant frequency in this range
-    dominant_idx = np.argmax(yf_range)
-    dominant_freq = xf_range[dominant_idx]
-    
-    # Decide bit based on which frequency is closer
-    f0_distance = abs(dominant_freq - f0)
-    f1_distance = abs(dominant_freq - f1)
-    
-    return '0' if f0_distance < f1_distance else '1'
+    return plaintext.decode('utf-8')
 
-def compute_energy_in_band(window, center_freq, bandwidth, sample_rate):
-    """Compute energy in a specific frequency band."""
-    n = len(window)
-    windowed = window * np.hanning(n)
-    yf = fft(windowed)
-    xf = fftfreq(n, 1 / sample_rate)
-    
-    positive_mask = xf > 0
-    xf_positive = xf[positive_mask]
-    yf_positive = np.abs(yf[positive_mask])
-    
-    band_mask = (xf_positive >= center_freq - bandwidth/2) & (xf_positive <= center_freq + bandwidth/2)
-    
-    if not np.any(band_mask):
-        return 0
-    
-    return np.sum(yf_positive[band_mask] ** 2)
 
-# =============================================================================
-# BIT DECODING
-# =============================================================================
+def compute_checksum(data_bytes: bytes) -> int:
+    """Compute simple 8-bit checksum (sum mod 256)."""
+    return sum(data_bytes) % 256
 
-def decode_bits(audio, bit_duration=BIT_DURATION, sample_rate=SAMPLE_RATE, f0=F0, f1=F1):
+
+def bits_to_bytes(bits: str) -> bytes:
+    """Convert binary string to bytes."""
+    byte_list = []
+    for i in range(0, len(bits), 8):
+        byte_str = bits[i:i+8]
+        if len(byte_str) == 8:
+            byte_list.append(int(byte_str, 2))
+    return bytes(byte_list)
+
+
+def demodulate_fsk(signal: np.ndarray, f0: float, f1: float,
+                   bit_duration: float, fs: int, 
+                   energy_threshold: float = DEFAULT_ENERGY_THRESHOLD) -> str:
     """
-    Decode bits from recorded audio.
+    Demodulate FSK signal using FFT with energy threshold.
     
-    Args:
-        audio: Recorded audio samples
-        bit_duration: Duration of each bit in seconds
-        sample_rate: Sample rate in Hz
-        f0: Frequency for bit 0
-        f1: Frequency for bit 1
-        
-    Returns:
-        Decoded bit string
+    Splits signal into bit-length windows and compares energy at f0 vs f1.
+    Windows below energy threshold are marked as '?' (uncertain).
     """
-    samples_per_bit = int(bit_duration * sample_rate)
-    num_bits = len(audio) // samples_per_bit
+    samples_per_bit = int(bit_duration * fs)
+    num_bits = len(signal) // samples_per_bit
     
-    bits = []
+    bitstream = []
+    
     for i in range(num_bits):
         start = i * samples_per_bit
         end = start + samples_per_bit
-        window = audio[start:end]
+        window = signal[start:end]
         
-        if len(window) == samples_per_bit:
-            bit = detect_frequency(window, sample_rate, f0, f1)
-            bits.append(bit)
-    
-    return ''.join(bits)
-
-# =============================================================================
-# PACKET PARSING
-# =============================================================================
-
-def find_packet_start(bits):
-    """
-    Find the start marker in the bit stream.
-    
-    Args:
-        bits: Decoded bit string
+        # Check energy threshold
+        window_energy = np.mean(window ** 2)
+        if window_energy < energy_threshold:
+            bitstream.append('?')  # Uncertain bit
+            continue
         
-    Returns:
-        Index of start marker, or -1 if not found
-    """
-    return bits.find(START_MARKER)
-
-def parse_packet(bits):
-    """
-    Parse a packet from the bit stream.
-    
-    Args:
-        bits: Bit string starting at packet beginning
+        # Apply Hanning window to reduce spectral leakage
+        windowed = window * np.hanning(len(window))
         
-    Returns:
-        Dictionary with parsed fields, or None if invalid
+        # Compute FFT
+        N = len(windowed)
+        spectrum = np.fft.fft(windowed)
+        freqs = np.fft.fftfreq(N, 1/fs)
+        magnitudes = np.abs(spectrum)
+        
+        # Find indices closest to f0 and f1
+        idx_f0 = np.argmin(np.abs(freqs - f0))
+        idx_f1 = np.argmin(np.abs(freqs - f1))
+        
+        # Compare magnitudes
+        mag_f0 = magnitudes[idx_f0]
+        mag_f1 = magnitudes[idx_f1]
+        
+        bit = '1' if mag_f1 > mag_f0 else '0'
+        bitstream.append(bit)
+    
+    return ''.join(bitstream)
+
+
+def apply_majority_voting(bitstream: str, repeat: int) -> str:
     """
-    if len(bits) < TOTAL_PACKET_SIZE:
-        return None
+    Apply majority voting to decode repeated bits.
     
-    # Find start marker
-    start_idx = find_packet_start(bits)
-    if start_idx == -1:
-        return None
+    If sender used --repeat N, each logical bit is transmitted N times.
+    Take the majority vote of each group of N bits.
+    """
+    if repeat <= 1:
+        return bitstream
     
-    # Extract packet from start marker
-    packet = bits[start_idx:start_idx + TOTAL_PACKET_SIZE]
+    result = []
+    for i in range(0, len(bitstream), repeat):
+        group = bitstream[i:i+repeat]
+        # Count 0s and 1s (ignore uncertain '?')
+        zeros = group.count('0')
+        ones = group.count('1')
+        
+        if ones > zeros:
+            result.append('1')
+        elif zeros > ones:
+            result.append('0')
+        else:
+            # Tie or all uncertain - default to 0
+            result.append('0')
     
-    if len(packet) < TOTAL_PACKET_SIZE:
-        return None
+    return ''.join(result)
+
+
+def find_packet_start(bitstream: str, preamble_bits: int = 32) -> int:
+    """
+    Find the START flag in the bitstream, skipping preamble.
     
-    # Parse fields
-    idx = 0
+    The preamble is 32 alternating bits (10101010...) which also contains
+    the START pattern. We search for START after the preamble region,
+    or fall back to the last occurrence if multiple matches exist.
     
-    start = packet[idx:idx + START_SIZE]
-    idx += START_SIZE
+    Returns: (index, is_encrypted) tuple
+    """
+    # First, try to find ENCRYPTED_FLAG after preamble
+    search_start = max(0, preamble_bits - 8)  # Allow some tolerance
+    encrypted_idx = bitstream.find(ENCRYPTED_FLAG, search_start)
+    start_idx = bitstream.find(START_FLAG, search_start)
     
-    unit_id_bin = packet[idx:idx + UNIT_ID_SIZE]
-    idx += UNIT_ID_SIZE
+    # Return whichever comes first (if both found)
+    if encrypted_idx >= 0 and start_idx >= 0:
+        if encrypted_idx < start_idx:
+            return encrypted_idx, True
+        else:
+            return start_idx, False
+    elif encrypted_idx >= 0:
+        return encrypted_idx, True
+    elif start_idx >= 0:
+        return start_idx, False
     
-    payload_bin = packet[idx:idx + PAYLOAD_SIZE]
-    idx += PAYLOAD_SIZE
+    # Fallback: find any occurrence
+    encrypted_idx = bitstream.find(ENCRYPTED_FLAG)
+    start_idx = bitstream.find(START_FLAG)
     
-    checksum_bin = packet[idx:idx + CHECKSUM_SIZE]
-    idx += CHECKSUM_SIZE
+    if encrypted_idx >= 0:
+        return encrypted_idx, True
+    return start_idx, False
+
+
+
+def parse_data_packet(bitstream: str, start_idx: int) -> dict:
+    """
+    Parse data mode packet.
     
-    end = packet[idx:idx + END_SIZE]
+    Format: [START:8][UNIT_ID:4][LENGTH:8][PAYLOAD:N*8][CHECKSUM:8][END:8]
+    """
+    pos = start_idx + 8  # Skip START
     
-    # Convert to values
-    unit_id = int(unit_id_bin, 2)
-    checksum = int(checksum_bin, 2)
+    # Unit ID: 4 bits
+    unit_id = int(bitstream[pos:pos+4], 2)
+    pos += 4
     
-    # Convert payload to hex
-    payload_hex = hex(int(payload_bin, 2))[2:].zfill(8)
+    # Length: 8 bits
+    length = int(bitstream[pos:pos+8], 2)
+    pos += 8
+    
+    # Payload: length * 8 bits
+    payload_bits = bitstream[pos:pos+(length*8)]
+    pos += length * 8
+    
+    # Checksum: 8 bits
+    checksum_received = int(bitstream[pos:pos+8], 2)
+    pos += 8
+    
+    # End flag: 8 bits
+    end_flag = bitstream[pos:pos+8]
+    
+    # Convert payload to bytes and text
+    payload_bytes = bits_to_bytes(payload_bits)
+    try:
+        payload_text = payload_bytes.decode('utf-8')
+    except:
+        payload_text = payload_bytes.hex()
+    
+    # Verify checksum
+    computed_checksum = compute_checksum(payload_bytes)
+    checksum_valid = (checksum_received == computed_checksum)
+    
+    # Verify end flag
+    end_valid = (end_flag == END_FLAG)
     
     return {
-        'start': start,
+        'mode': 'data',
         'unit_id': unit_id,
-        'unit_id_bin': unit_id_bin,
-        'payload_bin': payload_bin,
-        'payload_hex': payload_hex,
-        'checksum': checksum,
-        'checksum_bin': checksum_bin,
-        'end': end,
-        'raw_packet': packet
+        'payload': payload_text,
+        'payload_bytes': payload_bytes,
+        'checksum_received': checksum_received,
+        'checksum_computed': computed_checksum,
+        'checksum_valid': checksum_valid,
+        'end_valid': end_valid,
+        'valid': checksum_valid and end_valid
     }
 
-# =============================================================================
-# CHECKSUM VALIDATION
-# =============================================================================
 
-def validate_checksum(payload_hex, received_checksum):
+def parse_auth_packet(bitstream: str, start_idx: int, expected_secret: str = None) -> dict:
     """
-    Validate the packet checksum.
+    Parse auth mode packet.
     
-    Args:
-        payload_hex: Payload as hex string
-        received_checksum: Checksum from packet
-        
-    Returns:
-        True if valid, False otherwise
+    Format: [START:8][UNIT_ID:4][TOKEN:32][CHECKSUM:8][END:8]
     """
-    payload_bytes = bytes.fromhex(payload_hex)
-    computed_checksum = sum(payload_bytes) % 256
-    return computed_checksum == received_checksum
+    pos = start_idx + 8  # Skip START
+    
+    # Unit ID: 4 bits
+    unit_id = int(bitstream[pos:pos+4], 2)
+    pos += 4
+    
+    # Token: 32 bits
+    token_bits = bitstream[pos:pos+32]
+    token_int = int(token_bits, 2)
+    token_hex = format(token_int, '08x')
+    pos += 32
+    
+    # Checksum: 8 bits
+    checksum_received = int(bitstream[pos:pos+8], 2)
+    pos += 8
+    
+    # End flag: 8 bits
+    end_flag = bitstream[pos:pos+8]
+    
+    # Verify checksum
+    token_bytes = token_int.to_bytes(4, 'big')
+    computed_checksum = compute_checksum(token_bytes)
+    checksum_valid = (checksum_received == computed_checksum)
+    
+    # Verify end flag
+    end_valid = (end_flag == END_FLAG)
+    
+    # Verify token against expected secret if provided
+    auth_valid = None
+    if expected_secret:
+        expected_token = hashlib.sha256(expected_secret.encode()).hexdigest()[:8]
+        auth_valid = (token_hex == expected_token)
+    
+    return {
+        'mode': 'auth',
+        'unit_id': unit_id,
+        'token': token_hex,
+        'checksum_received': checksum_received,
+        'checksum_computed': computed_checksum,
+        'checksum_valid': checksum_valid,
+        'end_valid': end_valid,
+        'auth_valid': auth_valid,
+        'valid': checksum_valid and end_valid
+    }
 
-# =============================================================================
-# AUTHENTICATION
-# =============================================================================
 
-def authenticate(packet_data):
+def parse_encrypted_packet(bitstream: str, start_idx: int, decryption_key: str = None) -> dict:
     """
-    Perform authentication based on packet data.
+    Parse encrypted mode packet.
     
-    Args:
-        packet_data: Parsed packet dictionary
-        
-    Returns:
-        Tuple of (success: bool, message: str)
+    Format: [ENCRYPTED_FLAG:8][UNIT_ID:4][LENGTH:8][ENCRYPTED_DATA:N*8][CHECKSUM:8][END:8]
     """
-    # Verify start marker
-    if packet_data['start'] != START_MARKER:
-        return False, "Invalid START marker"
+    pos = start_idx + 8  # Skip ENCRYPTED_FLAG
     
-    # Verify end marker
-    if packet_data['end'] != END_MARKER:
-        return False, "Invalid END marker"
+    # Unit ID: 4 bits
+    unit_id = int(bitstream[pos:pos+4], 2)
+    pos += 4
     
-    # Validate checksum
-    if not validate_checksum(packet_data['payload_hex'], packet_data['checksum']):
-        return False, "Checksum mismatch"
+    # Length: 8 bits
+    length = int(bitstream[pos:pos+8], 2)
+    pos += 8
     
-    return True, "Packet valid"
+    # Encrypted payload: length * 8 bits
+    payload_bits = bitstream[pos:pos+(length*8)]
+    pos += length * 8
+    
+    # Checksum: 8 bits
+    checksum_received = int(bitstream[pos:pos+8], 2)
+    pos += 8
+    
+    # End flag: 8 bits
+    end_flag = bitstream[pos:pos+8]
+    
+    # Convert payload to bytes
+    encrypted_bytes = bits_to_bytes(payload_bits)
+    
+    # Verify checksum
+    computed_checksum = compute_checksum(encrypted_bytes)
+    checksum_valid = (checksum_received == computed_checksum)
+    
+    # Verify end flag
+    end_valid = (end_flag == END_FLAG)
+    
+    # Attempt decryption if key provided
+    decrypted_text = None
+    decryption_error = None
+    if decryption_key and checksum_valid and end_valid:
+        if not HAS_CRYPTO:
+            decryption_error = "cryptography library not installed"
+        else:
+            try:
+                decrypted_text = decrypt_payload(encrypted_bytes, decryption_key)
+            except Exception as e:
+                decryption_error = str(e)
+    
+    return {
+        'mode': 'encrypted',
+        'unit_id': unit_id,
+        'encrypted_bytes': encrypted_bytes,
+        'encrypted_hex': encrypted_bytes.hex(),
+        'decrypted_text': decrypted_text,
+        'decryption_error': decryption_error,
+        'checksum_received': checksum_received,
+        'checksum_computed': computed_checksum,
+        'checksum_valid': checksum_valid,
+        'end_valid': end_valid,
+        'valid': checksum_valid and end_valid
+    }
 
-def print_packet_info(packet_data):
-    """Print received packet information."""
-    print("\n" + "=" * 60)
-    print("RECEIVED PACKET")
-    print("=" * 60)
-    print(f"  START:      {packet_data['start']}")
-    print(f"  UNIT_ID:    {packet_data['unit_id_bin']} (Device {packet_data['unit_id']})")
-    print(f"  PAYLOAD:    {packet_data['payload_bin']}")
-    print(f"              (0x{packet_data['payload_hex'].upper()})")
-    print(f"  CHECKSUM:   {packet_data['checksum_bin']} ({packet_data['checksum']})")
-    print(f"  END:        {packet_data['end']}")
-    print("=" * 60)
+def record_audio(duration: float, fs: int) -> np.ndarray:
+    """Record audio from microphone."""
+    if not HAS_SOUNDDEVICE:
+        raise ImportError("sounddevice not installed. Use --input to read from WAV file.")
+    
+    print(f"[RECORDING] Recording for {duration} seconds...")
+    recording = sd.rec(int(duration * fs), samplerate=fs, channels=1, dtype='float64')
+    sd.wait()
+    print("[RECORDING] Done.")
+    return recording[:, 0]
 
-def print_authentication_result(success, message, packet_data=None):
-    """Print authentication result with formatting."""
-    print("\n" + "=" * 60)
-    if success:
-        print("       ✓ ACCESS GRANTED")
-        if packet_data:
-            print(f"       Device ID: {packet_data['unit_id']}")
-            print(f"       Token: 0x{packet_data['payload_hex'].upper()}")
-    else:
-        print("       ✗ ACCESS DENIED")
-        print(f"       Reason: {message}")
-    print("=" * 60 + "\n")
 
-# =============================================================================
-# MAIN
-# =============================================================================
+def load_wav(filepath: str, target_fs: int) -> np.ndarray:
+    """Load audio from WAV file."""
+    fs, data = wav_read(filepath)
+    
+    # Convert to mono if stereo
+    if len(data.shape) > 1:
+        data = data[:, 0]
+    
+    # Normalize to float
+    if data.dtype == np.int16:
+        data = data.astype(np.float64) / 32768.0
+    elif data.dtype == np.int32:
+        data = data.astype(np.float64) / 2147483648.0
+    
+    if fs != target_fs:
+        print(f"[WARNING] WAV sample rate ({fs}) differs from expected ({target_fs})")
+    
+    return data
+
 
 def main():
     parser = argparse.ArgumentParser(
-        description="BFSK Acoustic Authentication Receiver",
+        description="BFSK Acoustic Receiver - Decode FSK audio",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python receiver.py
-  python receiver.py --duration 8
-  python receiver.py --list-devices
-  python receiver.py --device 2
+  # Decode from WAV file (data mode)
+  python receiver.py --input packet.wav
+  
+  # Decode encrypted packet
+  python receiver.py --input packet.wav --key "mypassword"
+  
+  # Decode from WAV file (auth mode with verification)
+  python receiver.py --input packet.wav --auth-mode --secret "my_secret"
+  
+  # Record from microphone
+  python receiver.py --record 6
         """
     )
     
-    parser.add_argument('--duration', type=float, default=6.0,
-                        help='Recording duration in seconds (default: 6.0)')
-    parser.add_argument('--device', type=int, default=None,
-                        help='Input device ID (default: system default)')
-    parser.add_argument('--list-devices', action='store_true',
-                        help='List available input devices and exit')
-    parser.add_argument('--bit-duration', type=float, default=BIT_DURATION,
-                        help=f'Bit duration in seconds (default: {BIT_DURATION})')
-    parser.add_argument('--f0', type=int, default=F0,
-                        help=f'Frequency for bit 0 in Hz (default: {F0})')
-    parser.add_argument('--f1', type=int, default=F1,
-                        help=f'Frequency for bit 1 in Hz (default: {F1})')
-    parser.add_argument('--sample-rate', type=int, default=SAMPLE_RATE,
-                        help=f'Sample rate in Hz (default: {SAMPLE_RATE})')
-    parser.add_argument('--debug', action='store_true',
-                        help='Enable debug output')
+    parser.add_argument('--input', type=str, default=None,
+                        help='Input WAV file to decode')
+    parser.add_argument('--record', type=float, default=None,
+                        help='Record duration in seconds (requires sounddevice)')
+    parser.add_argument('--auth-mode', action='store_true',
+                        help='Parse as 32-bit auth token packet')
+    parser.add_argument('--secret', type=str, default=None,
+                        help='Expected secret for auth verification')
+    parser.add_argument('--key', type=str, default=None,
+                        help='Decryption key/password for AES encrypted packets')
+    parser.add_argument('--f0', type=float, default=DEFAULT_F0,
+                        help=f'Frequency for bit 0 (default: {DEFAULT_F0} Hz)')
+    parser.add_argument('--f1', type=float, default=DEFAULT_F1,
+                        help=f'Frequency for bit 1 (default: {DEFAULT_F1} Hz)')
+    parser.add_argument('--bit-duration', type=float, default=DEFAULT_BIT_DURATION,
+                        help=f'Bit duration in seconds (default: {DEFAULT_BIT_DURATION})')
+    parser.add_argument('--sample-rate', type=int, default=DEFAULT_SAMPLE_RATE,
+                        help=f'Sample rate (default: {DEFAULT_SAMPLE_RATE} Hz)')
+    parser.add_argument('--repeat', type=int, default=DEFAULT_REPEAT,
+                        help=f'Bit repetition factor used by sender (default: {DEFAULT_REPEAT})')
+    parser.add_argument('--energy-threshold', type=float, default=DEFAULT_ENERGY_THRESHOLD,
+                        help=f'Min signal energy to decode (default: {DEFAULT_ENERGY_THRESHOLD})')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Show decoded bitstream')
     
     args = parser.parse_args()
     
-    # Use local config values from args
-    cfg_f0 = args.f0
-    cfg_f1 = args.f1
-    cfg_bit_duration = args.bit_duration
-    cfg_sample_rate = args.sample_rate
+    # Get audio data
+    if args.input:
+        print(f"[INFO] Loading {args.input}")
+        signal = load_wav(args.input, args.sample_rate)
+    elif args.record:
+        signal = record_audio(args.record, args.sample_rate)
+    else:
+        parser.error("Specify --input or --record")
     
-    # List devices mode
-    if args.list_devices:
-        list_input_devices()
+    print(f"[INFO] Signal length: {len(signal)} samples ({len(signal)/args.sample_rate:.2f} seconds)")
+    print(f"[INFO] Frequencies: f0={args.f0} Hz, f1={args.f1} Hz")
+    
+    # Demodulate
+    bitstream = demodulate_fsk(signal, args.f0, args.f1, 
+                               args.bit_duration, args.sample_rate,
+                               args.energy_threshold)
+    
+    # Apply majority voting if bit repetition was used
+    if args.repeat > 1:
+        bitstream = apply_majority_voting(bitstream, args.repeat)
+        print(f"[INFO] Applied majority voting (repeat={args.repeat})")
+    
+    if args.verbose:
+        print(f"[DEBUG] Bitstream ({len(bitstream)} bits): {bitstream}")
+    
+    # Find packet start (preamble is 32 bits, scaled by repeat factor)
+    preamble_bits = 32 // args.repeat if args.repeat > 1 else 32
+    start_idx, is_encrypted = find_packet_start(bitstream, preamble_bits)
+    
+    if start_idx < 0:
+        print("[ERROR] START flag not found in signal")
         return
     
-    # Print configuration
-    print("\n" + "=" * 60)
-    print("BFSK ACOUSTIC RECEIVER")
-    print("=" * 60)
-    print(f"  Frequencies: F0={cfg_f0}Hz, F1={cfg_f1}Hz")
-    print(f"  Bit duration: {cfg_bit_duration*1000:.0f}ms")
-    print(f"  Sample rate: {cfg_sample_rate}Hz")
-    print(f"  Recording duration: {args.duration}s")
-    device_name = "default" if args.device is None else f"device {args.device}"
-    print(f"  Input device: {device_name}")
-    print("=" * 60 + "\n")
+    if is_encrypted:
+        print(f"[INFO] ENCRYPTED packet detected at bit {start_idx}")
+    else:
+        print(f"[INFO] START flag found at bit {start_idx}")
     
-    print("[RX] Waiting for transmission...")
+    # Parse packet based on type detected
+    if is_encrypted:
+        result = parse_encrypted_packet(bitstream, start_idx, args.key)
+    elif args.auth_mode:
+        result = parse_auth_packet(bitstream, start_idx, args.secret)
+    else:
+        result = parse_data_packet(bitstream, start_idx)
     
-    # Record audio
-    audio = record_audio(args.duration, device_id=args.device, sample_rate=cfg_sample_rate)
+    # Display results
+    print("\n" + "="*50)
+    print("DECODED PACKET")
+    print("="*50)
+    print(f"Mode: {result['mode'].upper()}")
+    print(f"Unit ID: {result['unit_id']}")
     
-    # Decode bits
-    print("[RX] Decoding bits...")
-    decoded_bits = decode_bits(audio, cfg_bit_duration, cfg_sample_rate, cfg_f0, cfg_f1)
+    if result['mode'] == 'data':
+        print(f"Payload: {result['payload']}")
+    elif result['mode'] == 'encrypted':
+        print(f"Encrypted Data: {result['encrypted_hex'][:64]}...")
+        if result['decrypted_text']:
+            print(f"🔓 Decrypted: {result['decrypted_text']}")
+        elif result['decryption_error']:
+            print(f"🔒 Decryption Failed: {result['decryption_error']}")
+        elif not args.key:
+            print("🔒 Encrypted (use --key to decrypt)")
+    else:
+        print(f"Token: {result['token']}")
     
-    if args.debug:
-        print(f"[DEBUG] Decoded {len(decoded_bits)} bits")
-        print(f"[DEBUG] Bits: {decoded_bits[:100]}..." if len(decoded_bits) > 100 else f"[DEBUG] Bits: {decoded_bits}")
+    print(f"Checksum: received={result['checksum_received']}, computed={result['checksum_computed']}")
+    print(f"Checksum Valid: {result['checksum_valid']}")
+    print(f"End Flag Valid: {result['end_valid']}")
     
-    # Find and parse packet
-    print("[RX] Searching for packet...")
-    packet_data = parse_packet(decoded_bits)
+    print("="*50)
     
-    if packet_data is None:
-        print("\n[RX] ERROR: No valid packet found!")
-        print_authentication_result(False, "No packet detected")
-        return
-    
-    # Print received packet info
-    print_packet_info(packet_data)
-    
-    # Authenticate
-    success, message = authenticate(packet_data)
-    print_authentication_result(success, message, packet_data if success else None)
+    if result['valid']:
+        if result['mode'] == 'auth' and result['auth_valid'] is not None:
+            if result['auth_valid']:
+                print("✓ ACCESS GRANTED")
+            else:
+                print("✗ ACCESS DENIED (token mismatch)")
+        elif result['mode'] == 'encrypted' and result['decrypted_text']:
+            print("✓ PACKET VALID & DECRYPTED")
+        else:
+            print("✓ PACKET VALID")
+    else:
+        print("✗ PACKET INVALID")
+
 
 if __name__ == "__main__":
     main()
-
