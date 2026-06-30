@@ -396,3 +396,7 @@ Built with signal processing and acoustic communication principles.
 
 
 made with love by :- Team Sudo-404
+Ayush Singh
+Kakadiya Megh Vipulbhai
+Neha Chaudhary
+Piyush Garg
